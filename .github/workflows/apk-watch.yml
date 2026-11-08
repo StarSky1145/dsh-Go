@@ -13,7 +13,7 @@ on:
     branches: [watch]
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: apk-${{ github.ref }}
@@ -70,17 +70,35 @@ jobs:
           channel: stable
           cache: true
 
-      # 引擎构建要把 Ubuntu base、Node、npm 包都下下来（几百 MB）：缓存住，第二次起只做校验。
-      - name: Restore the engine downloads
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: runtime/.cache
-          key: runtime-cache-${{ env.NODE_VERSION }}-${{ hashFiles('runtime/build-runtime.sh', 'runtime/lib/rtbuild.py', 'runtime/patches/pins.json') }}
-          restore-keys: |
-            runtime-cache-${{ env.NODE_VERSION }}-
-
-      - name: Build the bundled engine (arm64)
-        run: runtime/build-runtime.sh arm64-v8a
+      # 引擎（rootfs + proot）不在这里现做：runtime/build-runtime.sh 要按镜像索引
+      # 现下 Ubuntu 包，镜像一换版本号就是 404（上游 CI 也只跑引擎单测，发布包是本机打的）。
+      # 这次只改 Flutter 界面层，引擎用官方 release 里已经打好的那份，字节一致：
+      # 从 194MB 的 APK 里取出 assets/runtime/ 与 lib/arm64-v8a/ 下的 proot 四件套，
+      # 放进 gradle 期望的 runtime/out/arm64-v8a/（app/android/app/build.gradle.kts:70-76）。
+      - name: Take the engine from the upstream release
+        run: |
+          set -euo pipefail
+          url="https://github.com/ccch1mneyyy/dsh-Go/releases/download/v1.0.13/dsh-go-1.0.13-arm64.apk"
+          curl -fL --retry 3 --retry-delay 5 -o "$RUNNER_TEMP/upstream.apk" "$url"
+          out=runtime/out/arm64-v8a
+          rm -rf "$out"
+          mkdir -p "$out/assets" "$out/jniLibs/arm64-v8a"
+          unzip -q -o "$RUNNER_TEMP/upstream.apk" \
+            'assets/runtime/*' \
+            'lib/arm64-v8a/libproot.so' \
+            'lib/arm64-v8a/libproot-loader.so' \
+            'lib/arm64-v8a/libtalloc.so' \
+            'lib/arm64-v8a/libandroid-shmem.so' \
+            -d "$RUNNER_TEMP/upstream"
+          cp -R "$RUNNER_TEMP/upstream/assets/runtime" "$out/assets/"
+          cp "$RUNNER_TEMP"/upstream/lib/arm64-v8a/libproot.so \
+             "$RUNNER_TEMP"/upstream/lib/arm64-v8a/libproot-loader.so \
+             "$RUNNER_TEMP"/upstream/lib/arm64-v8a/libtalloc.so \
+             "$RUNNER_TEMP"/upstream/lib/arm64-v8a/libandroid-shmem.so \
+             "$out/jniLibs/arm64-v8a/"
+          test -s "$out/assets/runtime/manifest.json"
+          du -sh "$out"/*
+          ls -l "$out/jniLibs/arm64-v8a"
 
       - name: Flutter plugins and local.properties
         working-directory: app
@@ -105,7 +123,19 @@ jobs:
           apk=app/build/app/outputs/flutter-apk/app-arm64-release.apk
           ls -l "$apk"
           sha256sum "$apk" | tee apk-sha256.txt
-          "$ANDROID_HOME"/build-tools/*/aapt2 dump badging "$apk" | head -3 || true
+
+      - name: Publish the APK
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          apk=app/build/app/outputs/flutter-apk/app-arm64-release.apk
+          tag="watch-${{ github.run_number }}"
+          gh release create "$tag" "$apk#dsh-go-watch-arm64.apk" \
+            --title "dsh-go 手表版 $tag" \
+            --notes "手表适配构建：294dp 方屏排版缩放、强制轻量档、启动路径精简。引擎取自 v1.0.13 官方包。sha256 见附件旁的 apk-sha256.txt。" \
+            --latest=false || gh release upload "$tag" "$apk#dsh-go-watch-arm64.apk" --clobber
+          gh release upload "$tag" apk-sha256.txt --clobber || true
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
