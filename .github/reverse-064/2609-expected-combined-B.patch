@@ -1,0 +1,435 @@
+diff --git a/runtime/bridge/dsh-go-bridge/lib/native/core.js b/runtime/bridge/dsh-go-bridge/lib/native/core.js
+index f403acf9070a1937c35eda044d3846e72d85ae42..a6aa226b20ae2ef1b1ad8009e810d8914e69b677 100644
+--- a/runtime/bridge/dsh-go-bridge/lib/native/core.js
++++ b/runtime/bridge/dsh-go-bridge/lib/native/core.js
+@@ -5,6 +5,7 @@ import { randomBytes } from "node:crypto";
+ import { existsSync, readFileSync, statSync } from "node:fs";
+ import { createRequire } from "node:module";
+ import { dirname, isAbsolute, join } from "node:path";
++import { performance } from "node:perf_hooks";
+ import { fileURLToPath, pathToFileURL } from "node:url";
+ import { ID, LIMITS, PKG, PROTOCOL, TONES, ICON } from "./limits.js";
+ import { parseManifest, renderPlugin } from "./manifest.js";
+@@ -316,7 +317,7 @@ export class NativeCore {
+ 
+   /** Token bucket + concurrency per plugin; returns a release function or undefined (429). */
+   admitInvoke(pkg) {
+-    const now = Date.now();
++    const now = performance.now();
+     let b = this.buckets.get(pkg);
+     if (b === undefined) {
+       b = { tokens: LIMITS.invokeBurst, at: now, inflight: 0 };
+@@ -520,7 +521,7 @@ export class Feed {
+     this.cancel = undefined;
+     this.waiters = [];
+     this.pending = undefined;
+-    this.lastFlush = 0;
++    this.lastFlush = undefined;
+     this.timer = undefined;
+     this.linger = undefined;
+     this.lastUsed = Date.now();
+@@ -576,7 +577,8 @@ export class Feed {
+     if (this.stopped) return;
+     this.pending = { value };
+     if (this.timer !== undefined) return;
+-    const wait = Math.max(0, this.lastFlush + 1000 / LIMITS.dataHz - Date.now());
++    const wait = this.lastFlush === undefined ? 0
++      : Math.max(0, Math.ceil(this.lastFlush + 1000 / LIMITS.dataHz - performance.now()));
+     this.timer = setTimeout(() => this.#flush(), wait);
+     this.timer.unref?.();
+   }
+@@ -586,7 +588,7 @@ export class Feed {
+     if (this.stopped || this.pending === undefined) return;
+     const next = this.pending.value;
+     this.pending = undefined;
+-    this.lastFlush = Date.now();
++    this.lastFlush = performance.now();
+     const prev = this.data;
+     if (prev !== undefined && deepEqual(prev, next)) return;
+     const base = this.rev;
+diff --git a/runtime/tests/native-feed-clock.test.mjs b/runtime/tests/native-feed-clock.test.mjs
+new file mode 100644
+index 0000000000000000000000000000000000000000..b9d84532bc4d163713b5f15484224798ca59a119
+--- /dev/null
++++ b/runtime/tests/native-feed-clock.test.mjs
+@@ -0,0 +1,150 @@
++import { test } from 'node:test';
++import assert from 'node:assert/strict';
++import { performance } from 'node:perf_hooks';
++import { fixture } from './support/native-feed-fixture.mjs';
++
++const WALL = 1000000;
++const DATA0 = { t: 'data', data: { n: 0 } };
++const PATCH1 = { t: 'patch', merge: { n: 1 } };
++
++async function setup(t) {
++  const clock = { mono: 0, wall: WALL };
++  const steps = [], sends = [];
++  let f, timeout;
++  const requests = () => timeout?.mock.calls.map(call => call.arguments[1]) ?? [];
++  t.after(async () => {
++    try {
++      await Promise.resolve(); // Let the real producer hand its cancel back through call().
++      t.diagnostic(JSON.stringify({ case: t.name, steps, sends, timeoutRequests: requests() }));
++    } finally {
++      try { f?.close(); } finally { t.mock.reset(); }
++    }
++  });
++  t.mock.timers.enable({ apis: ['setTimeout'], now: 0 });
++  t.mock.method(Date, 'now', () => clock.wall);
++  t.mock.method(performance, 'now', () => clock.mono);
++  f = fixture();
++  await Promise.resolve();
++  f.feed.attach({ id: 'clock', send: message => sends.push({
++    mono: clock.mono, wallOffset: clock.wall - WALL, message,
++  }) });
++  // Pass through to Node's public MockTimers. Registration's 300 ms timer predates this spy.
++  timeout = t.mock.method(globalThis, 'setTimeout');
++  return {
++    emit(value) {
++      steps.push({ op: 'emit', mono: clock.mono, wallOffset: clock.wall - WALL, value });
++      f.emit(value);
++    },
++    advance(delta, wallOffset) {
++      clock.mono += delta; clock.wall = WALL + wallOffset;
++      steps.push({ op: 'advance', delta, mono: clock.mono, wallOffset });
++      t.mock.timers.tick(delta);
++    },
++    // Preserve all event types; remove only routing and opaque revision fields from the oracle.
++    events: () => sends.map(({ message: { sub, rev, base, ...event } }) => event),
++    messages: () => sends.map(({ message }) => message),
++    requests,
++    get rev() { return f.feed.rev; },
++  };
++}
++
++function first(f) {
++  f.emit({ n: 0 });
++  assert.deepEqual(f.events(), [], 'first emit must remain asynchronous');
++  f.advance(0, 0);
++  assert.deepEqual(f.events(), [DATA0], 'first data preparation');
++  assert.equal(typeof f.rev, 'string');
++  return f.rev;
++}
++
++function patch(f, base, n) {
++  const message = f.messages().at(-1);
++  assert.equal(message.t, 'patch');
++  assert.equal(message.base, base);
++  assert.notEqual(message.rev, base);
++  assert.equal(f.rev, message.rev);
++  assert.deepEqual(message.merge, { n });
++}
++
++test('R1 ordinary feed publishes after elapsed time despite wall rollback', async t => {
++  const f = await setup(t), base = first(f);
++  f.advance(300, 300); // Complete registration's unrelated changed timer before the correction.
++  f.advance(700, -59000);
++  f.emit({ n: 1 });
++  assert.deepEqual(f.events(), [DATA0], 'R1 emit remains asynchronous');
++  f.advance(0, -59000);
++  assert.deepEqual(f.events(), [DATA0, PATCH1],
++    'R1 semantic oracle: a wall rollback must not stall an elapsed ordinary feed window');
++  assert.deepEqual(f.requests(), [0, 0]);
++  patch(f, base, 1);
++});
++
++test('R2 ordinary feed retains its elapsed window after a forward wall correction', async t => {
++  const f = await setup(t), base = first(f);
++  f.advance(100, 60100);
++  f.emit({ n: 1 });
++  assert.deepEqual(f.events(), [DATA0], 'R2 emit remains asynchronous');
++  f.advance(0, 60100);
++  assert.deepEqual(f.events(), [DATA0],
++    'R2 semantic oracle: a wall correction must not release an ordinary feed update before its elapsed window');
++  assert.deepEqual(f.requests(), [0, 150]);
++  f.advance(149, 60249);
++  assert.deepEqual(f.events(), [DATA0]);
++  f.advance(1, 60250);
++  assert.deepEqual(f.events(), [DATA0, PATCH1]);
++  patch(f, base, 1);
++});
++
++test('C1 ordinary feed keeps zero, asynchronous first, latest value and armed timer distinct', async t => {
++  const f = await setup(t);
++  f.emit({ n: 1 }); f.emit({ n: 2 });
++  assert.deepEqual(f.requests(), [0]);
++  assert.deepEqual(f.events(), []);
++  f.advance(0, 0);
++  const data = { t: 'data', data: { n: 2 } }, base = f.rev;
++  assert.deepEqual(f.events(), [data]);
++  f.emit({ n: 3 });
++  assert.deepEqual(f.requests(), [0, 250], 'a real flush at mono zero starts a full window');
++  f.advance(0, 0);
++  assert.deepEqual(f.events(), [data]);
++  f.advance(100, 100); f.emit({ n: 4 });
++  assert.deepEqual(f.requests(), [0, 250], 'an armed timer is not rescheduled');
++  f.advance(149, 249);
++  assert.deepEqual(f.events(), [data]);
++  f.advance(1, 250);
++  assert.deepEqual(f.events(), [data, { t: 'patch', merge: { n: 4 } }]);
++  patch(f, base, 4);
++});
++
++test('C2 ordinary feed rounds a positive fractional request up without a private scheduler', async t => {
++  const f = await setup(t), base = first(f);
++  f.advance(99.25, 99); f.emit({ n: 1 });
++  // MockTimers retains fractional delays; inspect the actual public request, not a fake floor.
++  assert.deepEqual(f.requests(), [0, 151]);
++  assert.deepEqual(f.events(), [DATA0]);
++  f.advance(150, 249);
++  assert.deepEqual(f.events(), [DATA0]);
++  f.advance(0.75, 250);
++  assert.deepEqual(f.events(), [DATA0]);
++  f.advance(0.25, 250);
++  assert.deepEqual(f.events(), [DATA0, PATCH1]);
++  patch(f, base, 1);
++});
++
++test('C3 ordinary feed duplicate flush consumes its window without changing the revision', async t => {
++  const f = await setup(t), base = first(f);
++  f.advance(100, 100); f.emit({ n: 0 });
++  assert.deepEqual(f.requests(), [0, 150]);
++  f.advance(150, 250);
++  assert.deepEqual(f.events(), [DATA0]);
++  assert.equal(f.rev, base);
++  f.advance(100, 350); f.emit({ n: 1 });
++  assert.deepEqual(f.requests(), [0, 150, 150], 'the duplicate flush owns the next window');
++  f.advance(0, 350);
++  assert.deepEqual(f.events(), [DATA0]);
++  f.advance(149, 499);
++  assert.deepEqual(f.events(), [DATA0]);
++  f.advance(1, 500);
++  assert.deepEqual(f.events(), [DATA0, PATCH1]);
++  patch(f, base, 1);
++});
+diff --git a/runtime/tests/native-invoke-clock.test.mjs b/runtime/tests/native-invoke-clock.test.mjs
+new file mode 100644
+index 0000000000000000000000000000000000000000..9683438f5d9e2c62ca00ac9fb07cd52e554a6e67
+--- /dev/null
++++ b/runtime/tests/native-invoke-clock.test.mjs
+@@ -0,0 +1,224 @@
++// Real bridge HTTP admission; fake Loader identity and public clock mocks only.
++import { test } from 'node:test';
++import assert from 'node:assert/strict';
++import { createServer, request } from 'node:http';
++import { mkdirSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
++import { tmpdir } from 'node:os';
++import { join } from 'node:path';
++import { pathToFileURL } from 'node:url';
++import { performance } from 'node:perf_hooks';
++import { NativeCore } from '../bridge/dsh-go-bridge/lib/native/core.js';
++import { createNativeRoutes } from '../bridge/dsh-go-bridge/lib/native/routes.js';
++import { effectiveLimits } from '../bridge/dsh-go-bridge/lib/native/limits.js';
++
++const realSetTimeout = setTimeout, realClearTimeout = clearTimeout;
++const WATCHDOG_MS = 5000; // Does not replace the production handler's real 3000 ms deadline.
++const A = 'invoke-clock-a', B = 'invoke-clock-b';
++const copy = () => ({ copy: 'ok' });
++const copied = { status: 200, body: { v: 1, effects: [{ type: 'copy', text: 'ok' }], issues: [] }, retryAfter: null };
++const limited = { status: 429, body: { v: 1, error: { code: 'rate-limited', message: 'too many invokes' } }, retryAfter: '1' };
++const projection = r => ({ status: r.status, body: r.body, retryAfter: r.retryAfter });
++class FixtureError extends Error {
++  constructor(message, cause) { super(message, { cause }); this.code = 'INVOKE_CLOCK_FIXTURE'; }
++}
++function guard(actual, expected, label) {
++  try { assert.deepEqual(actual, expected); }
++  catch (error) { throw new FixtureError(label, error); }
++}
++function observed(promise) { promise.then(undefined, () => {}); return promise; }
++function deferred() {
++  let resolve, reject;
++  const promise = observed(new Promise((a, b) => { resolve = a; reject = b; }));
++  return { promise, resolve, reject };
++}
++function deadline(promise, label) {
++  return observed(new Promise((resolve, reject) => {
++    const timer = realSetTimeout(() => reject(new FixtureError(`${label}: real watchdog`)), WATCHDOG_MS);
++    promise.then(value => { realClearTimeout(timer); resolve(value); }, error => { realClearTimeout(timer); reject(error); });
++  }));
++}
++function candidateResponse(r, label) {
++  // Only a complete lawful copy or a real rate rejection reaches a semantic oracle.
++  // In particular, the unchanged handler deadline's 504 is a fixture blocker.
++  if (r.status === 200) guard(projection(r), copied, `${label}: copy response`);
++  else {
++    guard(r.status, 429, `${label}: unexpected HTTP status`);
++    guard(r.body, limited.body, `${label}: rate response body`);
++    guard(typeof r.retryAfter === 'string' && /^[1-9][0-9]*$/.test(r.retryAfter), true, `${label}: Retry-After`);
++  }
++}
++
++async function fixture(t) {
++  let dir, core, routes, server, port, closing = false;
++  const wallOrigin = Date.now(), clock = { wall: wallOrigin, mono: 0 };
++  const mocks = [], disposers = [], gates = [], clientWork = [], serverWork = [], failures = [], trace = [], warnings = [];
++  const requests = new Set(), sockets = new Set();
++  const counts = new Map([[A, 0], [B, 0]]), queues = new Map([[A, []], [B, []]]);
++  t.after(async () => {
++    closing = true;
++    const errors = [];
++    const attempt = fn => { try { fn(); } catch (error) { errors.push(error); } };
++    try {
++      for (const gate of gates) { gate.release(); gate.enter.reject(new FixtureError('cleanup before handler entry')); }
++      for (const req of requests) req.destroy();
++      try { await deadline(Promise.allSettled([...clientWork, ...serverWork]), 'HTTP cleanup'); }
++      catch (error) { errors.push(error); }
++      while (disposers.length) attempt(disposers.pop());
++      attempt(() => routes?.dispose());
++      attempt(() => core?.dispose());
++      for (const socket of sockets) socket.destroy();
++      if (server) {
++        attempt(() => server.closeAllConnections());
++        try {
++          await deadline(new Promise((resolve, reject) => server.close(error => {
++            if (error && error.code !== 'ERR_SERVER_NOT_RUNNING') reject(error); else resolve();
++          })), 'server close');
++        } catch (error) { errors.push(error); }
++      }
++    } catch (error) { errors.push(error); } finally {
++      while (mocks.length) attempt(() => mocks.pop().mock.restore());
++      if (dir) attempt(() => rmSync(dir, { recursive: true, force: true }));
++      const fixtureFailures = [...failures, ...errors].map(error => ({ name: error?.name, code: error?.code, message: String(error?.message ?? error) }));
++      t.diagnostic(`INVOKE_CLOCK_TRACE ${JSON.stringify({ requests: trace, warnings, fixtureFailures })}`);
++    }
++    if (failures.length || errors.length) throw new FixtureError('fixture asynchronous work or cleanup failed', new AggregateError([...failures, ...errors]));
++  });
++  try {
++    mocks.push(t.mock.method(Date, 'now', () => clock.wall));
++    mocks.push(t.mock.method(performance, 'now', () => clock.mono));
++    dir = mkdtempSync(join(tmpdir(), 'native-invoke-clock-'));
++    const entries = [A, B].map((pkg, index) => {
++      const folder = join(dir, pkg); mkdirSync(folder);
++      writeFileSync(join(folder, 'package.json'), JSON.stringify({ name: pkg, version: '1.0.0', dshGo: { v: 1, contributes: { panels: [{ id: 'panel', title: 'Panel' }] } } }));
++      writeFileSync(join(folder, 'index.js'), '');
++      return { options: { name: pathToFileURL(join(folder, 'index.js')).href }, parent: { tree: { ctx: { baseUrl: pathToFileURL(folder + '/').href } } }, fiber: { uid: index + 1 } };
++    });
++    const limits = effectiveLimits({}); guard(limits.handlerTimeoutMs, 3000, 'unchanged handler deadline');
++    core = new NativeCore({ get: name => name === 'loader' ? { entries: () => entries } : undefined, logger: { warn: (...args) => warnings.push(args.map(String)) } }, limits, 'test');
++    routes = createNativeRoutes(core);
++    for (const [index, pkg] of [A, B].entries()) {
++      const service = Object.assign(Object.create(core.service), { ctx: { fiber: { entry: entries[index] }, effect(fn) { const off = fn(); disposers.push(off); return off; } } });
++      service.panel('panel', { view: { type: 'text', text: 'Copy' }, actions: { copy() {
++        counts.set(pkg, counts.get(pkg) + 1);
++        const gate = queues.get(pkg).shift();
++        if (gate) { gate.enter.resolve(); return gate.result.promise; }
++        return copy();
++      } } });
++    }
++    server = createServer((req, res) => {
++      req.on('error', () => {}); res.on('error', () => {}); // Client completion/error guards own transport failures.
++      if (closing) { req.resume(); res.destroy(); return; }
++      const url = new URL(req.url, 'http://local');
++      const work = routes.handle(req, res, url.pathname, url); serverWork.push(work);
++      work.then(handled => {
++        if (!handled) { failures.push(new FixtureError('route was not handled')); res.destroy(); }
++      }, error => { failures.push(new FixtureError('route rejected outside dispatch', error)); res.destroy(); });
++    });
++    server.on('connection', socket => { sockets.add(socket); socket.on('error', () => {}); socket.once('close', () => sockets.delete(socket)); });
++    server.on('error', error => { if (!closing) failures.push(new FixtureError('HTTP server error', error)); });
++    await deadline(new Promise((resolve, reject) => {
++      const failed = error => reject(new FixtureError('listen failed', error));
++      server.once('error', failed);
++      server.once('listening', () => { server.off('error', failed); resolve(); });
++      server.listen(0, '127.0.0.1');
++    }), 'listen');
++    port = server.address().port;
++  } catch (error) {
++    throw error instanceof FixtureError ? error : new FixtureError('fixture setup failed', error);
++  }
++
++  function invoke(pkg = A) {
++    const at = { pkg, mono: clock.mono, wallOffset: clock.wall - wallOrigin };
++    const wire = JSON.stringify({ v: 1, pkg, id: 'panel', surface: 'panel', action: 'copy', scope: { sessionId: 's' }, userGesture: true });
++    const work = observed(new Promise((resolve, reject) => {
++      let req, timer, settled = false, responseSeen = false;
++      const fail = (label, cause) => {
++        if (settled) return;
++        settled = true; realClearTimeout(timer); requests.delete(req);
++        const error = new FixtureError(label, cause); trace.push({ ...at, error: label, entered: counts.get(pkg) });
++        reject(error); req?.destroy();
++      };
++      req = request({ host: '127.0.0.1', port, path: '/dsh-go/v1/invoke', method: 'POST', agent: false, headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(wire), connection: 'close' } }, res => {
++        responseSeen = true; const chunks = [];
++        res.on('data', chunk => chunks.push(chunk));
++        res.on('aborted', () => fail('response aborted'));
++        res.on('error', error => fail('response error', error));
++        res.on('close', () => { if (!settled) fail('response closed before end'); });
++        res.on('end', () => {
++          if (settled) return;
++          if (!res.complete) { fail('response was incomplete'); return; }
++          const rawBody = Buffer.concat(chunks).toString('utf8'); let body;
++          try { body = JSON.parse(rawBody); } catch (error) { fail('response was not JSON', error); return; }
++          const value = { status: res.statusCode, body, retryAfter: res.headers['retry-after'] ?? null };
++          settled = true; realClearTimeout(timer); requests.delete(req);
++          trace.push({ ...at, ...value, rawBody, headers: res.headers, entered: counts.get(pkg), complete: res.complete });
++          resolve(value);
++        });
++      });
++      requests.add(req);
++      req.on('error', error => fail('request error', error));
++      req.on('close', () => { if (!settled && !responseSeen) fail('request closed without a response'); });
++      timer = realSetTimeout(() => fail('HTTP real watchdog'), WATCHDOG_MS);
++      req.end(wire);
++    }).catch(error => { throw error instanceof FixtureError ? error : new FixtureError('request setup failed', error); }));
++    clientWork.push(work); return work;
++  }
++  return {
++    invoke,
++    at(mono, wallOffset) { clock.mono = mono; clock.wall = wallOrigin + wallOffset; },
++    count: pkg => counts.get(pkg),
++    hold(pkg = A) {
++      const enter = deferred(), result = deferred();
++      const gate = { enter, result, release: () => result.resolve(copy()) };
++      gates.push(gate); queues.get(pkg).push(gate);
++      return { entered: deadline(enter.promise, 'handler entry'), release: gate.release };
++    },
++  };
++}
++
++test('R1 invoke accepts a fresh copy after elapsed time despite wall rollback', { concurrency: false }, async t => {
++  const f = await fixture(t);
++  guard(projection(await f.invoke()), copied, 'R1 first copy'); guard(f.count(A), 1, 'R1 first handler entry');
++  f.at(1000, -59000);
++  const response = await f.invoke(); candidateResponse(response, 'R1 second copy');
++  assert.deepEqual({ ...projection(response), entered: f.count(A) }, { ...copied, entered: 2 }, 'R1 semantic oracle: rollback must not reject the next lawful copy');
++});
++
++test('R2 invoke does not refill a spent burst on a wall clock jump', { concurrency: false }, async t => {
++  const f = await fixture(t);
++  for (let i = 1; i <= 8; i++) {
++    guard(projection(await f.invoke()), copied, `R2 initial copy ${i}`); guard(f.count(A), i, `R2 handler entry ${i}`);
++  }
++  f.at(100, 60100);
++  const response = await f.invoke(); candidateResponse(response, 'R2 ninth copy');
++  assert.deepEqual({ ...projection(response), entered: f.count(A) }, { ...limited, entered: 8 }, 'R2 semantic oracle: a wall jump must not replenish the relative budget');
++});
++
++test('C1 invoke starts at monotonic zero and retains burst and elapsed refill', { concurrency: false }, async t => {
++  const f = await fixture(t);
++  for (let i = 1; i <= 8; i++) {
++    guard(projection(await f.invoke()), copied, `C1 initial copy ${i}`); guard(f.count(A), i, `C1 handler entry ${i}`);
++  }
++  guard(projection(await f.invoke()), limited, 'C1 exhausted burst'); guard(f.count(A), 8, 'C1 rejected request did not enter');
++  f.at(250, 250);
++  guard(projection(await f.invoke()), copied, 'C1 elapsed refill'); guard(f.count(A), 9, 'C1 refill handler entry');
++  guard(projection(await f.invoke()), limited, 'C1 one refill is spent'); guard(f.count(A), 9, 'C1 second rejection did not enter');
++});
++
++test('C2 invoke keeps concurrency, release and package buckets independent', { concurrency: false }, async t => {
++  const f = await fixture(t), pending = [];
++  for (let i = 1; i <= 4; i++) {
++    const gate = f.hold(), work = f.invoke(); pending.push({ gate, work });
++    await gate.entered; guard(f.count(A), i, `C2 held handler ${i}`);
++  }
++  guard(projection(await f.invoke()), limited, 'C2 concurrency limit'); guard(f.count(A), 4, 'C2 concurrent rejection did not enter');
++  guard(projection(await f.invoke(B)), copied, 'C2 other package while A is full'); guard(f.count(B), 1, 'C2 other handler entry');
++  pending[0].gate.release(); guard(projection(await pending[0].work), copied, 'C2 first release completes');
++  for (let i = 5; i <= 8; i++) {
++    guard(projection(await f.invoke()), copied, `C2 released slot copy ${i}`); guard(f.count(A), i, `C2 released slot entry ${i}`);
++  }
++  guard(projection(await f.invoke()), limited, 'C2 burst exhausted with only three held'); guard(f.count(A), 8, 'C2 spent burst did not enter');
++  guard(projection(await f.invoke(B)), copied, 'C2 other package after A budget is spent'); guard(f.count(B), 2, 'C2 independent second entry');
++  for (const { gate } of pending.slice(1)) gate.release();
++  for (const { work } of pending.slice(1)) guard(projection(await work), copied, 'C2 remaining held copy completes');
++});
