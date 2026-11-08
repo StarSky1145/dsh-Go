@@ -1,0 +1,111 @@
+# reverse temp branch only (request core20-062). Not product; never merged; ci.yml untouched.
+# One Linux job: tree A (base + TESTONLY) -> A -> strict expected-red gate + identity gate -> tree B (base + FULL)
+# -> B1 -> gates -> B2 -> gates -> B3 -> gates. Four node --test calls in total, one each.
+# No npm/pnpm, no node_modules, no DSH_PREFIX. Each tree is a fresh detached worktree at the base.
+name: reverse core20 062
+
+on:
+  push:
+    branches: [reverse/core20-062]
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: 24.22.1
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  bridge:
+    name: Request 062 native stream clock A B1 B2 B3
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      BASE: 3a91fab9e80d2a92be071a74b8b208214d7e6277
+      R: .github/reverse-062
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      - name: Tool cache before setup-node (report only)
+        run: |
+          set +e
+          echo "RUNNER_TOOL_CACHE=$RUNNER_TOOL_CACHE"
+          echo "NODE_TOOL_CACHE_ENTRIES_BEFORE:"; ls -1 "$RUNNER_TOOL_CACHE/node" 2>&1
+          [ -d "$RUNNER_TOOL_CACHE/node/24.22.1" ] && echo "NODE_24_22_1_PRESENT_BEFORE=yes" || echo "NODE_24_22_1_PRESENT_BEFORE=no"
+          echo "PATH_NODE_BEFORE=$(command -v node)"
+          exit 0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        id: setupnode
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: Toolchain (report only; setup-node metadata, no product load)
+        run: |
+          set +e
+          mkdir -p "$RUNNER_TEMP/out"
+          echo "SETUP_NODE_OUTPUT node-version=${{ steps.setupnode.outputs.node-version }} cache-hit=${{ steps.setupnode.outputs.cache-hit }}"
+          echo "NODE_TOOL_CACHE_ENTRIES_AFTER:"; ls -1 "$RUNNER_TOOL_CACHE/node" 2>&1
+          echo "CHECKOUT_HEAD=$(git rev-parse HEAD) PARENTS=$(git log -1 --format=%P)"
+          git log -2 --format='COMMIT %H parents=%P author=%an <%ae> %s'
+          echo "SHALLOW=$(git rev-parse --is-shallow-repository) SHALLOW_FILE=$(cat "$(git rev-parse --git-dir)/shallow" 2>/dev/null | tr '\n' ' ')"
+          echo "NODE_BIN $(command -v node) PYTHON $(python3 --version 2>&1) PYTHON_BIN $(command -v python3) $(git --version)"
+          uname -srmv
+          grep -E '^(PRETTY_NAME|VERSION_ID)=' /etc/os-release
+          echo "HOME=$HOME RUNNER_TEMP=$RUNNER_TEMP TZ=${TZ-unset} TMPDIR=${TMPDIR-unset} DSH_HOME=${DSH_HOME-unset} DSH_PREFIX=${DSH_PREFIX-unset} UID=$(id -u) USER=$(id -un)"
+          exit 0
+      - name: Raw patch identity (copied out of tree)
+        run: |
+          set +e
+          mkdir "$RUNNER_TEMP/raw" || exit 1
+          cp "$R/2607-native-stream-monotonic-LF.patch" "$R/2607-TESTONLY-native-stream-monotonic-LF.patch" "$RUNNER_TEMP/raw/" || exit 1
+          cp "$R/ident062.py" "$R/tap062.py" "$RUNNER_TEMP/" || exit 1
+          python3 -I "$RUNNER_TEMP/ident062.py" raw "$RUNNER_TEMP/raw"
+      - name: Prepare A (base + TESTONLY)
+        id: prepA
+        run: bash "$R/prep062.sh" A 2607-TESTONLY-native-stream-monotonic-LF.patch
+      - name: A (only command, then blocking identity gate)
+        id: A
+        if: steps.prepA.outcome == 'success'
+        run: bash "$R/test062.sh" A
+      - name: Strict expected-red gate A (exit 1, R1/R2 semantic reds only, C1-C3 plain ok)
+        id: gA
+        if: steps.A.outcome == 'success'
+        run: python3 -I "$RUNNER_TEMP/tap062.py" A "$RUNNER_TEMP/out/A-node-test.stdout" "$RUNNER_TEMP/out/A-node-test.stderr" "${{ steps.A.outputs.rc }}" "$RUNNER_TEMP/tree-A"
+      - name: Prepare B (independent base + FULL)
+        id: prepB
+        if: steps.gA.outcome == 'success'
+        run: bash "$R/prep062.sh" B 2607-native-stream-monotonic-LF.patch
+      - name: B1 (only command, then blocking identity gate)
+        id: B1
+        if: steps.prepB.outcome == 'success'
+        run: bash "$R/test062.sh" B1
+      - name: Result gate B1 (exit 0, five names plain ok, exact diagnostics)
+        id: gB1
+        if: steps.B1.outcome == 'success'
+        run: python3 -I "$RUNNER_TEMP/tap062.py" B1 "$RUNNER_TEMP/out/B1-node-test.stdout" "$RUNNER_TEMP/out/B1-node-test.stderr" "${{ steps.B1.outputs.rc }}" "$RUNNER_TEMP/tree-B"
+      - name: B2 (only command, then blocking identity gate)
+        id: B2
+        if: steps.gB1.outcome == 'success'
+        run: bash "$R/test062.sh" B2
+      - name: Result gate B2 (exit 0, two ws-close-timer names plain ok)
+        id: gB2
+        if: steps.B2.outcome == 'success'
+        run: python3 -I "$RUNNER_TEMP/tap062.py" B2 "$RUNNER_TEMP/out/B2-node-test.stdout" "$RUNNER_TEMP/out/B2-node-test.stderr" "${{ steps.B2.outputs.rc }}" "$RUNNER_TEMP/tree-B"
+      - name: B3 (only command, then blocking identity gate)
+        id: B3
+        if: steps.gB2.outcome == 'success'
+        run: bash "$R/test062.sh" B3
+      - name: Result gate B3 (exit 0, the media stop case once plain ok, nothing else executed)
+        id: gB3
+        if: steps.B3.outcome == 'success'
+        run: python3 -I "$RUNNER_TEMP/tap062.py" B3 "$RUNNER_TEMP/out/B3-node-test.stdout" "$RUNNER_TEMP/out/B3-node-test.stderr" "${{ steps.B3.outputs.rc }}" "$RUNNER_TEMP/tree-B"
+      - name: Upload request 062 outputs (reverse temp branch only)
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: reverse-062-outputs
+          path: ${{ runner.temp }}/out
