@@ -103,23 +103,28 @@ class PerformanceDefaults {
     required this.recommendRemote,
   });
 
-  factory PerformanceDefaults.resolve(PerformanceSnapshot snapshot, PerformancePrefs prefs) {
+  /// [watch]: 手表（见 `device_class.dart`）。手表一律走轻量档——模糊、灵动动效、
+  /// 宠物在 294dp 的方屏上既不显示好也费电，而档位本身由系统归类决定，
+  /// 这颗手表的 SoC 未必被归成 low，所以这里直接按住，不靠猜。
+  /// 只有一项反过来：手表上引擎必须自己起（[autoStartLocal]），没有第二台主机可连。
+  factory PerformanceDefaults.resolve(PerformanceSnapshot snapshot, PerformancePrefs prefs, {bool watch = false}) {
     final light =
+        watch ||
         snapshot.thermalLightweight ||
         switch (prefs.mode) {
           PerformanceMode.auto => snapshot.tier == DeviceTier.low,
           PerformanceMode.full => false,
           PerformanceMode.light => true,
         };
-    final reduceMotion = !(prefs.animations ?? !light);
+    final reduceMotion = watch || !(prefs.animations ?? !light);
     return PerformanceDefaults(
       lightweight: light,
-      blur: prefs.blur ?? !light,
+      blur: watch ? false : prefs.blur ?? !light,
       reduceMotion: reduceMotion,
       fluidMotion: !reduceMotion && (prefs.fluid ?? !light),
       petEnabled: !light,
-      autoStartLocal: !light,
-      recommendRemote: light || snapshot.tier == DeviceTier.low,
+      autoStartLocal: watch || !light,
+      recommendRemote: watch ? false : light || snapshot.tier == DeviceTier.low,
     );
   }
 

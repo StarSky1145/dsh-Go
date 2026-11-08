@@ -11,6 +11,7 @@ import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../../performance/device_class.dart';
 import '../../state/wallpaper_state.dart';
 import '../../wallpaper/wallpaper_look.dart';
 import '../../wallpaper/wallpaper_render.dart';
@@ -92,6 +93,13 @@ class _WallpaperBackdropState extends ConsumerState<WallpaperBackdrop> with Sing
 
   @override
   Widget build(BuildContext context) {
+    // 手表: 只画主题自带的那层渐变，不读壁纸、不烤图。
+    // 自定义壁纸要走「按屏幕尺寸解码 + 重新模糊」的一次性烘焙，冷启动时那一下在
+    // 手表上尤其贵；而它在 1.2 寸屏上只是装饰。页面底色仍由 AppBackdrop 画，
+    // 所以透明底的页面不会变黑。
+    if (DeviceClass.isWatch) {
+      return AppBackdrop(picture: null, child: Theme(data: Theme.of(context), child: widget.child));
+    }
     final frame = WallpaperBackdrop.frameOf(context);
     if (MediaQuery.maybeHighContrastOf(context) ?? false) {
       // The system's high contrast: the plain page.

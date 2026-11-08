@@ -25,6 +25,7 @@ import '../../pets/pet_overlay_bridge.dart';
 import '../../pets/pet_pack.dart';
 import '../../pets/pet_prefs.dart';
 import '../../pets/pet_sheets.dart';
+import '../../performance/device_class.dart';
 import '../../pets/pet_signals.dart';
 import '../../pets/pet_state.dart';
 import '../../state/chat_state.dart';
@@ -170,6 +171,9 @@ class _PetStageState extends ConsumerState<PetStage> {
 
   @override
   Widget build(BuildContext context) {
+    // 手表: 不挂宠物层。它会随对话状态变表情、按帧重绘，在 294dp 的方屏上既画不开
+    // 也是纯粹的耗电项；页面本身（对话、输入框）原样返回，该有的都在。
+    if (DeviceClass.isWatch) return widget.child;
     // The overlay outside the app hears every state while the chat lives.
     ref.listen<void>(petOverlayBridgeProvider, (_, _) {});
     return PetPerchScope(

@@ -6,6 +6,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'companion/companion_initiative_owner.dart' show companionInitiativeProvider;
 import 'l10n/l10n.dart';
+import 'performance/device_class.dart';
 import 'performance/performance_state.dart';
 import 'performance/refresh_rate.dart';
 import 'state/app_info.dart';
@@ -16,6 +17,7 @@ import 'state/tile_style_state.dart';
 import 'ui/chat/dsh_ui/dsh_ui_model.dart' show DshUiAppAccent;
 import 'ui/common/side_insets.dart';
 import 'ui/launch/launch_overlay.dart';
+import 'ui/shell/adaptive/watch_frame.dart';
 import 'ui/shell/root_gate.dart';
 import 'ui/theme/theme.dart';
 import 'ui_config/ui_config_state.dart';
@@ -55,18 +57,25 @@ class _DshAppState extends ConsumerState<DshApp> with WidgetsBindingObserver {
     super.initState();
     // Start loading the stored tile style now, so 全部功能 opens in it rather
     // than flashing the default first.
-    ref.read(tileStyleProvider);
-    // Anonymous usage statistics live as long as the app, in either 界面
-    // (release builds: today is noted, and earlier days go out).
-    ref.read(usageStatsProvider);
-    // 公测版: the star prompt counts time in front from launch, in either 界面.
-    if (ref.read(starPromptGateProvider)) ref.read(starPromptProvider);
-    // 伙伴小屋: her invitation ledger is read now, so it is known before the room opens.
-    ref.read(companionInitiativeProvider);
-    // 刷新率: some systems cap third-party apps at 60 Hz and then show their per-app
-    // switch as an in-app setting; the app answers frames to run at the fastest rate
-    // while it is actually drawing (see RefreshRateService).
-    RefreshRateService.instance.start();
+    // 手表: 这几样都是「首帧之后再读也不迟」的东西(次级界面的样式、统计上报、
+    // 伙伴小屋的邀请、星标提示)。手表开机本来就慢，首帧前一条都不读——省掉的是
+    // 冷启动路径上的 prefs/网络，界面上的效果一点不少。
+    if (!DeviceClass.isWatch) {
+      ref.read(tileStyleProvider);
+      // Anonymous usage statistics live as long as the app, in either 界面
+      // (release builds: today is noted, and earlier days go out).
+      ref.read(usageStatsProvider);
+      // 公测版: the star prompt counts time in front from launch, in either 界面.
+      if (ref.read(starPromptGateProvider)) ref.read(starPromptProvider);
+      // 伙伴小屋: her invitation ledger is read now, so it is known before the room opens.
+      ref.read(companionInitiativeProvider);
+      // 刷新率: some systems cap third-party apps at 60 Hz and then show their per-app
+      // switch as an in-app setting; the app answers frames to run at the fastest rate
+      // while it is actually drawing (see RefreshRateService).
+      // 手表不声明刷新率: 屏幕最高 60Hz，声明了只是多一条常驻的平台调用，
+      // 交给系统按省电策略决定更划算。
+      RefreshRateService.instance.start();
+    }
     WidgetsBinding.instance.addObserver(this);
   }
 
@@ -146,9 +155,12 @@ class _DshAppState extends ConsumerState<DshApp> with WidgetsBindingObserver {
   @override
   Widget build(BuildContext context) {
     // 刷新率设置改动时告诉原生;setMode 对同一个值不做任何事。
-    unawaited(
-      RefreshRateService.instance.setMode(ref.watch(performancePrefsProvider.select((p) => p.refreshRate))),
-    );
+    // 手表从没 start() 过，也就没有跟着改的东西。
+    if (!DeviceClass.isWatch) {
+      unawaited(
+        RefreshRateService.instance.setMode(ref.watch(performancePrefsProvider.select((p) => p.refreshRate))),
+      );
+    }
     final themeMode = ref.watch(uiThemeModeProvider.select((s) => s.value));
     final appearance = ref.watch(appearanceProvider);
     final waiting =
@@ -187,15 +199,18 @@ class _DshAppState extends ConsumerState<DshApp> with WidgetsBindingObserver {
         final media = MediaQuery.of(context);
         return MediaQuery(
           data: media.copyWith(disableAnimations: media.disableAnimations || performance.reduceMotion),
-          child: AppMotionScope(
-            fluid: fluid,
-            child: ThemeRevealHost(
-              child: Stack(
-                fit: StackFit.expand,
-                children: [
-                  MirroredSideInsets(child: child!),
-                  const LaunchLayer(),
-                ],
+          // 手表: 整页按 0.9 缩回去画，界面按它本来设计的宽度排版(watch_frame.dart)。
+          child: WatchFrame(
+            child: AppMotionScope(
+              fluid: fluid,
+              child: ThemeRevealHost(
+                child: Stack(
+                  fit: StackFit.expand,
+                  children: [
+                    MirroredSideInsets(child: child!),
+                    const LaunchLayer(),
+                  ],
+                ),
               ),
             ),
           ),

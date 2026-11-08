@@ -5,6 +5,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'device_class.dart';
 import 'performance_policy.dart';
 
 export 'performance_policy.dart';
@@ -166,7 +167,11 @@ final performancePrefsProvider = NotifierProvider<PerformancePrefsController, Pe
 );
 
 final performanceDefaultsProvider = Provider<PerformanceDefaults>(
-  (ref) => PerformanceDefaults.resolve(ref.watch(performanceProvider), ref.watch(performancePrefsProvider)),
+  (ref) => PerformanceDefaults.resolve(
+    ref.watch(performanceProvider),
+    ref.watch(performancePrefsProvider),
+    watch: DeviceClass.isWatch,
+  ),
 );
 
 /// Both facts and stored overrides must be available before deriving a startup default.

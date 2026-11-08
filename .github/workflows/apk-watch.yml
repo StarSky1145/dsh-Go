@@ -1,0 +1,117 @@
+# 手表适配分支的 APK 构建：GitHub 上出 arm64 安装包（不发布 Release）。
+#
+# 上游 ci.yml 只跑单测，不出包；出包要两段：
+#   1. runtime/build-runtime.sh arm64-v8a   → runtime/out/arm64-v8a（rootfs + proot）
+#   2. tooling/build-apk.sh                 → app/build/app/outputs/flutter-apk/*.apk
+# gradlew 不在仓库里（上游用 gradle/actions/setup-gradle 提供 Gradle），
+# 所以先 `gradle wrapper` 把 wrapper 生出来，构建脚本才能调 ./gradlew。
+name: APK (watch)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [watch]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: apk-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FLUTTER_VERSION: 3.47.7
+  NODE_VERSION: 24.22.1
+  GRADLE_VERSION: 9.3.1
+  TZ: Asia/Shanghai
+  # 表盘上跑的这版：版本名带上 watch，装到同一台机器上能看出是哪个包。
+  APP_VERSION: 1.0.14-watch.1
+
+jobs:
+  # 便宜的一步先跑：Dart 编译错误、未用 import 在这里就拦住，不白花十几分钟构建引擎。
+  analyze:
+    name: Analyze
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+      - working-directory: app
+        run: |
+          flutter pub get --enforce-lockfile
+          flutter analyze --no-pub
+
+  apk:
+    name: arm64 APK
+    needs: analyze
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      DSH_MAVEN_MIRRORS: 0 # The Aliyun mirrors are slow and unreliable from a US runner.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      # 引擎构建要把 Ubuntu base、Node、npm 包都下下来（几百 MB）：缓存住，第二次起只做校验。
+      - name: Restore the engine downloads
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: runtime/.cache
+          key: runtime-cache-${{ env.NODE_VERSION }}-${{ hashFiles('runtime/build-runtime.sh', 'runtime/lib/rtbuild.py', 'runtime/patches/pins.json') }}
+          restore-keys: |
+            runtime-cache-${{ env.NODE_VERSION }}-
+
+      - name: Build the bundled engine (arm64)
+        run: runtime/build-runtime.sh arm64-v8a
+
+      - name: Flutter plugins and local.properties
+        working-directory: app
+        run: |
+          flutter pub get --enforce-lockfile
+          printf 'sdk.dir=%s\nflutter.sdk=%s\n' "$ANDROID_HOME" "$FLUTTER_ROOT" > android/local.properties
+
+      - uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+        with:
+          gradle-version: ${{ env.GRADLE_VERSION }}
+
+      # gradlew is not tracked upstream; without it `flutter build apk` has no wrapper to run.
+      - name: Generate the Gradle wrapper
+        working-directory: app/android
+        run: gradle wrapper --gradle-version "$GRADLE_VERSION" --distribution-type bin -q
+
+      - name: Build the APK
+        run: tooling/build-apk.sh --build-name "$APP_VERSION"
+
+      - name: Checksums
+        run: |
+          apk=app/build/app/outputs/flutter-apk/app-arm64-release.apk
+          ls -l "$apk"
+          sha256sum "$apk" | tee apk-sha256.txt
+          "$ANDROID_HOME"/build-tools/*/aapt2 dump badging "$apk" | head -3 || true
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: dsh-go-watch-arm64
+          path: |
+            app/build/app/outputs/flutter-apk/app-arm64-release.apk
+            apk-sha256.txt
+          if-no-files-found: error
+          retention-days: 30
