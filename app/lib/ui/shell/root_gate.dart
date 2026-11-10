@@ -6,6 +6,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../launch/launch_state.dart';
+import '../../performance/device_class.dart';
 import '../../runtime/local_footprint.dart';
 import '../../diagnostics/diagnostics_publish.dart';
 import '../../runtime/runtime_bridge.dart';
@@ -359,9 +360,16 @@ class _RootGateState extends ConsumerState<RootGate> {
           onKeyDone: _afterKey,
         );
       } else {
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          if (mounted) _maybeAutoStart();
-        });
+        // 平时等第一帧画完再起引擎，别和首帧抢 CPU；手表上反过来：这一帧很简单
+        // (对话页的骨架)，而引擎是冷启动里最贵的一段(rootfs 解包 + node 起 proot)，
+        // 先派出去让它和首帧并行，屏幕亮起来的时刻不变，能说话的时刻提前。
+        if (DeviceClass.isWatch) {
+          _maybeAutoStart();
+        } else {
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (mounted) _maybeAutoStart();
+          });
+        }
         // The native shell or the web page, by 界面 (ui_mode_state.dart); an
         // install from before usage statistics is told about them there, once.
         child = UsageUpgradeNotice(child: widget.home ?? const ModeHome());
